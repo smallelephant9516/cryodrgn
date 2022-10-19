@@ -113,6 +113,9 @@ def add_args(parser):
     group.add_argument('--activation', choices=('relu','leaky_relu'), default='relu', help='Activation (default: %(default)s)')
     return parser
 
+def contrast_loss(v1,v2):
+    return F.CrossEntropyLoss(v1,v2)
+
 def make_model(args, lattice, enc_mask, in_dim):
     return HetOnlyVAE(
         lattice,
