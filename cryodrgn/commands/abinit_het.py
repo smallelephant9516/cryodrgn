@@ -60,7 +60,7 @@ def add_args(parser):
     group.add_argument('--max-threads', type=int, default=16, help='Maximum number of CPU cores for FFT parallelization (default: %(default)s)')
 
     group = parser.add_argument_group('Symmetry parameters')
-    group.add_argument('--helix', action='store_true', help='Processing helical structure')
+    group.add_argument('--helix', help='Processing helical structure')
 
     group = parser.add_argument_group('Tilt series')
     group.add_argument('--tilt', help='Particle stack file (.mrcs)')
@@ -185,12 +185,14 @@ def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equi
     z_mu, z_logvar = unparallelize(model).encode(*input_)
     z = unparallelize(model).reparameterize(z_mu, z_logvar)
 
-    if y_neighbor:
+    if y_neighbor is not None:
+        y_neighbor=(y_neighbor,)
         if use_ctf:
             y_neighbor = (x * ctf_i.sign() for x in y_neighbor)
         neighbor_mu, neighbor_logvar = unparallelize(model).encode(*y_neighbor)
         z_neighbor = unparallelize(model).reparameterize(neighbor_mu, neighbor_logvar)
-        loss_neighbor = F.CrossEntropyLoss (z, z_neighbor)
+        neighbor_loss = F.cosine_similarity(z, z_neighbor)
+        neighbor_loss=torch.mean(neighbor_loss)
 
     if equivariance is not None:
         lamb, equivariance_loss = equivariance
@@ -247,7 +249,8 @@ def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equi
         loss += lamb*eq_loss
 
     if y_neighbor:
-        loss+=loss_neighbor
+        print(gen_loss,kld,neighbor_loss)
+        loss+=neighbor_loss
 
 
     loss.backward()
@@ -442,7 +445,8 @@ def main(args):
     else: ctf_params = None
 
     if args.helix is not None:
-        helix_neighbor = np.load(args.helix)
+        helix_neighbor = np.load(args.helix, allow_pickle=True)
+        neighbor_id = np.array([np.random.choice(lst, 1) for lst in helix_neighbor])
 
     lattice = Lattice(D, extent=0.5, device=device)
     if args.enc_mask is None:
@@ -567,8 +571,12 @@ def main(args):
         for batch in data_iterator:
             ind = batch[-1]
             if args.helix:
-                neighbor_id=np.array([np.random.choice(lst,1) for lst in helix_neighbor])
-                y_neighbor=data[neighbor_id]
+                neighbor_select=neighbor_id[ind]
+                y_neighbor=data[neighbor_select][0]
+                image_size=len(y_neighbor[0][0])
+                y_neighbor=torch.tensor(y_neighbor)
+                y_neighbor=y_neighbor.view((-1,image_size,image_size))
+                y_neighbor=y_neighbor.to(device)
             ind_np = ind.cpu().numpy()
             batch = (batch[0].to(device), None) if tilt is None else (batch[0].to(device), batch[1].to(device))
             batch_it += len(batch[0])

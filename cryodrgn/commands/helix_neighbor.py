@@ -4,8 +4,8 @@ import numpy as np
 
 def add_args(parser):
     parser.add_argument('star', help='Input starfile' )
-    parser.add_argument('--relion31', help='whether use relion31 files or not')
-    parser.add_argument('--filament', help='take the whole filament as neighbor')
+    parser.add_argument('--relion31', action='store_true',help='whether use relion31 files or not')
+    parser.add_argument('--filament', action='store_true', help='take the whole filament as neighbor')
     parser.add_argument('--w', help='number of filament as neighbor')
     parser.add_argument('--o', help='output filament id')
     return parser
@@ -13,10 +13,10 @@ def add_args(parser):
 def star2dataframe(filename, relion31=None):
     Rvar = []  # read the variables metadata
     Rdata = []  # read the data
-    start_read_line=0
+    start_read_line=1
     if relion31:
         start_read_line=20
-    for star_line in open(self.file).readlines()[start_read_line:]:
+    for star_line in open(filename).readlines()[start_read_line:]:
         if star_line.find("_rln") != -1:
             var = star_line.split()
             Rvar.append(var[0])
@@ -26,6 +26,7 @@ def star2dataframe(filename, relion31=None):
         else:
             Rdata.append(star_line.split())
 
+    print(Rdata[0],Rvar)
 
     data = pd.DataFrame(data=Rdata,columns=Rvar)
 
@@ -53,6 +54,7 @@ def get_pair_index(dataframe, w=None, filament=None):
             lst=dataframe[(dataframe['helicaltube']==tube_id)&(dataframe['filename']==mic_id)].index.to_numpy()
             filament_pairs.append(lst)
     filament_pairs=np.array(filament_pairs)
+    print(np.shape(filament_pairs),filament_pairs[0])
     return filament_pairs
 
 
@@ -62,7 +64,6 @@ def main(args):
     dataframe=star2dataframe(args.star, relion31=args.relion31)
     neighbor_id=get_pair_index(dataframe, w=args.w, filament=args.filament)
     np.save(args.o, neighbor_id)
-
 
 
 if __name__ == '__main__':
