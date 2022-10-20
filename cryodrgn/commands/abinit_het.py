@@ -59,6 +59,9 @@ def add_args(parser):
     group.add_argument('--preprocessed', action='store_true', help='Skip preprocessing steps if input data is from cryodrgn preprocess_mrcs') 
     group.add_argument('--max-threads', type=int, default=16, help='Maximum number of CPU cores for FFT parallelization (default: %(default)s)')
 
+    group = parser.add_argument_group('Symmetry parameters')
+    group.add_argument('--helix', action='store_true', help='Processing helical structure')
+
     group = parser.add_argument_group('Tilt series')
     group.add_argument('--tilt', help='Particle stack file (.mrcs)')
     group.add_argument('--tilt-deg', type=float, default=45, help='X-axis tilt offset in degrees (default: %(default)s)')
@@ -113,9 +116,6 @@ def add_args(parser):
     group.add_argument('--activation', choices=('relu','leaky_relu'), default='relu', help='Activation (default: %(default)s)')
     return parser
 
-def contrast_loss(v1,v2):
-    return F.CrossEntropyLoss(v1,v2)
-
 def make_model(args, lattice, enc_mask, in_dim):
     return HetOnlyVAE(
         lattice,
@@ -161,7 +161,7 @@ def pretrain(model, lattice, optim, minibatch, tilt):
     optim.step()
     return gen_loss.item()
 
-def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equivariance=None, enc_only=False, poses=None, ctf_params=None):
+def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equivariance=None, enc_only=False, poses=None, ctf_params=None, y_neighbor=None):
     y, yt = minibatch
     use_tilt = yt is not None
     use_ctf = ctf_params is not None
@@ -184,6 +184,13 @@ def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equi
         input_ = (x*ctf_i.sign() for x in input_) # phase flip by the ctf
     z_mu, z_logvar = unparallelize(model).encode(*input_)
     z = unparallelize(model).reparameterize(z_mu, z_logvar)
+
+    if y_neighbor:
+        if use_ctf:
+            y_neighbor = (x * ctf_i.sign() for x in y_neighbor)
+        neighbor_mu, neighbor_logvar = unparallelize(model).encode(*y_neighbor)
+        z_neighbor = unparallelize(model).reparameterize(neighbor_mu, neighbor_logvar)
+        loss_neighbor = F.CrossEntropyLoss (z, z_neighbor)
 
     if equivariance is not None:
         lamb, equivariance_loss = equivariance
@@ -238,6 +245,10 @@ def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equi
 
     if equivariance is not None:
         loss += lamb*eq_loss
+
+    if y_neighbor:
+        loss+=loss_neighbor
+
 
     loss.backward()
 
@@ -430,6 +441,9 @@ def main(args):
         ctf_params = torch.tensor(ctf_params, device=device)
     else: ctf_params = None
 
+    if args.helix is not None:
+        helix_neighbor = np.load(args.helix)
+
     lattice = Lattice(D, extent=0.5, device=device)
     if args.enc_mask is None:
         args.enc_mask = D//2
@@ -552,6 +566,9 @@ def main(args):
             flog('Using previous iteration poses')
         for batch in data_iterator:
             ind = batch[-1]
+            if args.helix:
+                neighbor_id=np.array([np.random.choice(lst,1) for lst in helix_neighbor])
+                y_neighbor=data[neighbor_id]
             ind_np = ind.cpu().numpy()
             batch = (batch[0].to(device), None) if tilt is None else (batch[0].to(device), batch[1].to(device))
             batch_it += len(batch[0])
@@ -575,7 +592,7 @@ def main(args):
                 cc = 0
 
             ctf_i = ctf_params[ind] if ctf_params is not None else None
-            gen_loss, kld, loss, eq_loss, pose = train(model, lattice, ps, optim, L_model, batch, beta, args.beta_control, equivariance_tuple, enc_only=args.enc_only, poses=p, ctf_params=ctf_i)
+            gen_loss, kld, loss, eq_loss, pose = train(model, lattice, ps, optim, L_model, batch, beta, args.beta_control, equivariance_tuple, enc_only=args.enc_only, poses=p, ctf_params=ctf_i, y_neighbor=y_neighbor)
             # logging
             poses.append((ind.cpu().numpy(),pose))
             kld_accum += kld*len(ind)
