@@ -191,8 +191,11 @@ def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equi
             y_neighbor = (x * ctf_i.sign() for x in y_neighbor)
         neighbor_mu, neighbor_logvar = unparallelize(model).encode(*y_neighbor)
         z_neighbor = unparallelize(model).reparameterize(neighbor_mu, neighbor_logvar)
-        neighbor_loss = F.cosine_similarity(z, z_neighbor)
-        neighbor_loss=torch.mean(neighbor_loss)
+        #cos similarity
+        #neighbor_loss = F.cosine_similarity(z, z_neighbor)
+        #neighbor_loss=torch.mean(neighbor_loss)
+        #mse loss
+        neighbor_loss=F.mse_loss(z, z_neighbor)
 
     if equivariance is not None:
         lamb, equivariance_loss = equivariance
@@ -577,6 +580,8 @@ def main(args):
                 y_neighbor=torch.tensor(y_neighbor)
                 y_neighbor=y_neighbor.view((-1,image_size,image_size))
                 y_neighbor=y_neighbor.to(device)
+            else:
+                y_neighbor=None
             ind_np = ind.cpu().numpy()
             batch = (batch[0].to(device), None) if tilt is None else (batch[0].to(device), batch[1].to(device))
             batch_it += len(batch[0])
