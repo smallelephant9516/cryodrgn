@@ -61,6 +61,8 @@ def add_args(parser):
 
     group = parser.add_argument_group('Symmetry parameters')
     group.add_argument('--helix', help='Processing helical structure')
+    group.add_argument('--helix_beta', help='Processing helical structure')
+    group.add_argument('--helix_loss', help='loss function for helix contrast learning')
 
     group = parser.add_argument_group('Tilt series')
     group.add_argument('--tilt', help='Particle stack file (.mrcs)')
@@ -116,6 +118,14 @@ def add_args(parser):
     group.add_argument('--activation', choices=('relu','leaky_relu'), default='relu', help='Activation (default: %(default)s)')
     return parser
 
+def off_diagonal(x):
+    # return a flattened view of the off-diagonal elements of a square matrix
+    n, m = x.shape
+    assert n == m
+    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+
+
+
 def make_model(args, lattice, enc_mask, in_dim):
     return HetOnlyVAE(
         lattice,
@@ -161,7 +171,8 @@ def pretrain(model, lattice, optim, minibatch, tilt):
     optim.step()
     return gen_loss.item()
 
-def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equivariance=None, enc_only=False, poses=None, ctf_params=None, y_neighbor=None):
+def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equivariance=None, enc_only=False, poses=None,
+          ctf_params=None, y_neighbor=None, helix_beta=None,helix_loss=None):
     y, yt = minibatch
     use_tilt = yt is not None
     use_ctf = ctf_params is not None
@@ -191,11 +202,22 @@ def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equi
             y_neighbor = (x * ctf_i.sign() for x in y_neighbor)
         neighbor_mu, neighbor_logvar = unparallelize(model).encode(*y_neighbor)
         z_neighbor = unparallelize(model).reparameterize(neighbor_mu, neighbor_logvar)
-        #cos similarity
-        #neighbor_loss = F.cosine_similarity(z, z_neighbor)
-        #neighbor_loss=torch.mean(neighbor_loss)
-        #mse loss
-        neighbor_loss=F.mse_loss(z, z_neighbor)
+        if helix_loss == 'cos_sim':
+            neighbor_loss = F.cosine_similarity(z, z_neighbor)
+            neighbor_loss=torch.mean(neighbor_loss)
+        elif helix_loss == 'Barlow_twins':
+            # from https://github.com/facebookresearch/barlowtwins
+            batch_norm=nn.BatchNorm1d(len(z_neighbor))
+            z_norm = batch_norm(z)
+            z_neighbor_norm = batch_norm(z_neighbor)
+            c=z_norm.T @ z_neighbor_norm
+            on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
+            off_diag = off_diagonal(c).pow_(2).sum()
+            neighbor_loss = on_diag + off_diag
+
+        elif helix_loss == None:
+            #mse loss
+            neighbor_loss=F.mse_loss(z, z_neighbor)
 
     if equivariance is not None:
         lamb, equivariance_loss = equivariance
@@ -252,8 +274,10 @@ def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equi
         loss += lamb*eq_loss
 
     if y_neighbor:
-        print(gen_loss,kld,neighbor_loss)
-        loss+=neighbor_loss
+        if helix_beta is None:
+            helix_beta=1
+        loss+=float(helix_beta)*neighbor_loss
+        print(gen_loss, kld, neighbor_loss)
 
 
     loss.backward()
@@ -449,7 +473,6 @@ def main(args):
 
     if args.helix is not None:
         helix_neighbor = np.load(args.helix, allow_pickle=True)
-        neighbor_id = np.array([np.random.choice(lst, 1) for lst in helix_neighbor])
 
     lattice = Lattice(D, extent=0.5, device=device)
     if args.enc_mask is None:
@@ -571,8 +594,14 @@ def main(args):
 
         if epoch % args.ps_freq != 0:
             flog('Using previous iteration poses')
+
+        if args.helix is not None:
+            neighbor_id = np.array([np.random.choice(lst, 1) for lst in helix_neighbor])
+
         for batch in data_iterator:
             ind = batch[-1]
+            y_neighbor=None
+            helix_beta=None
             if args.helix:
                 neighbor_select=neighbor_id[ind]
                 y_neighbor=data[neighbor_select][0]
@@ -580,8 +609,7 @@ def main(args):
                 y_neighbor=torch.tensor(y_neighbor)
                 y_neighbor=y_neighbor.view((-1,image_size,image_size))
                 y_neighbor=y_neighbor.to(device)
-            else:
-                y_neighbor=None
+                helix_beta= args.helix_beta if args.helix_beta else None
             ind_np = ind.cpu().numpy()
             batch = (batch[0].to(device), None) if tilt is None else (batch[0].to(device), batch[1].to(device))
             batch_it += len(batch[0])
@@ -605,7 +633,8 @@ def main(args):
                 cc = 0
 
             ctf_i = ctf_params[ind] if ctf_params is not None else None
-            gen_loss, kld, loss, eq_loss, pose = train(model, lattice, ps, optim, L_model, batch, beta, args.beta_control, equivariance_tuple, enc_only=args.enc_only, poses=p, ctf_params=ctf_i, y_neighbor=y_neighbor)
+            gen_loss, kld, loss, eq_loss, pose = train(model, lattice, ps, optim, L_model, batch, beta, args.beta_control, equivariance_tuple, enc_only=args.enc_only, poses=p, ctf_params=ctf_i,
+                                                       y_neighbor=y_neighbor,helix_beta=helix_beta, helix_loss=args.helix_loss)
             # logging
             poses.append((ind.cpu().numpy(),pose))
             kld_accum += kld*len(ind)
