@@ -206,14 +206,14 @@ def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equi
             neighbor_loss = F.cosine_similarity(z, z_neighbor)
             neighbor_loss=torch.mean(neighbor_loss)
         elif helix_loss == 'Barlow_twins':
-            # from https://github.com/facebookresearch/barlowtwins
-            batch_norm=nn.BatchNorm1d(len(z_neighbor))
+            # idea from https://github.com/facebookresearch/barlowtwins
+            batch_norm=nn.BatchNorm1d(z.shape[-1],device='cuda:0')
             z_norm = batch_norm(z)
             z_neighbor_norm = batch_norm(z_neighbor)
             c=z_norm.T @ z_neighbor_norm
             on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
             off_diag = off_diagonal(c).pow_(2).sum()
-            neighbor_loss = on_diag + off_diag
+            neighbor_loss = torch.mean(on_diag + off_diag)
 
         elif helix_loss == None:
             #mse loss
