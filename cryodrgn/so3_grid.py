@@ -12,13 +12,21 @@ from . import lie_tools
 def grid_s1(resol):
     Npix = 6*2**resol
     dt = 2*np.pi/Npix
-    grid = np.arange(Npix)*dt + dt/2
+    range=np.append(np.arange(3*Npix/16,5*Npix/16)*dt,np.arange(7*Npix/16,9*Npix/16)*dt)
+    grid = range + dt/2
+    print(len(grid))
     return grid
 
 def grid_s2(resol):
     Nside = 2**resol
     Npix = 12*Nside*Nside
     theta, phi = pix2ang(Nside, np.arange(Npix), nest=True)
+    print(theta)
+    pose_np=np.array([theta,phi])
+    pose_np=pose_np[:,pose_np[0,:]<=np.pi/18]
+    theta=pose_np[0]
+    phi=pose_np[1]
+    print(len(theta))
     return theta, phi
 
 def hopf_to_quat(theta, phi, psi):

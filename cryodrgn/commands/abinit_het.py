@@ -144,7 +144,7 @@ def make_model(args, lattice, enc_mask, in_dim):
         feat_sigma=args.feat_sigma,
     )
 
-def pretrain(model, lattice, optim, minibatch, tilt):
+def pretrain(args, model, lattice, optim, minibatch, tilt):
     y, yt = minibatch
     use_tilt = yt is not None
     B = y.size(0)
@@ -551,7 +551,7 @@ def main(args):
         for batch in data_iterator:
             global_it += len(batch[0])
             batch = (batch[0].to(device), None) if tilt is None else (batch[0].to(device), batch[1].to(device))
-            loss = pretrain(model, lattice, optim, batch, tilt=ps.tilt)
+            loss = pretrain(args, model, lattice, optim, batch, tilt=ps.tilt)
             if global_it % args.log_interval == 0:
                 flog(f'[Pretrain Iteration {global_it}] loss={loss:4f}')
             if global_it > args.pretrain:
