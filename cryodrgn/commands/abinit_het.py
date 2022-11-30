@@ -539,7 +539,7 @@ def main(args):
     ps = PoseSearch(pose_model, lattice, args.l_start, args.l_end, tilt,
                     t_extent=args.t_extent, t_ngrid=args.t_ngrid, niter=args.niter,
                     nkeptposes=args.nkeptposes, base_healpy=args.base_healpy,
-                    t_xshift=args.t_xshift, t_yshift=args.t_yshift, device=device)
+                    t_xshift=args.t_xshift, t_yshift=args.t_yshift, device=device,helix=args.helix)
 
     data_iterator = DataLoader(data, batch_size=args.batch_size, shuffle=True)
 

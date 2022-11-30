@@ -10,6 +10,7 @@ from cryodrgn import so3_grid
 from cryodrgn import shift_grid
 from cryodrgn import utils
 from cryodrgn.lattice import Lattice
+from scipy.spatial.transform import Rotation as RR
 
 log = utils.log
 vlog = utils.vlog
@@ -71,8 +72,14 @@ class PoseSearch:
         t_xshift=0,
         t_yshift=0,
         device=None,
+        helix=None
     ):
 
+        helix=True
+        if helix is not None:
+            FAST_INPLANE=False
+        print('is helix mode',helix, 'fast inplane', FAST_INPLANE)
+        self.helix = helix
         self.model = model
         self.lattice = lattice
         self.base_healpy = base_healpy
@@ -80,6 +87,7 @@ class PoseSearch:
         self.base_quat = (
             so3_grid.s2_grid_SO3(base_healpy) if FAST_INPLANE else self.so3_base_quat
         )
+        print(len(self.base_quat))
         self.so3_base_rot = lie_tools.quaternions_to_SO3(to_tensor(self.so3_base_quat)).to(device)
         self.base_rot = lie_tools.quaternions_to_SO3(to_tensor(self.base_quat)).to(device)
 
@@ -314,6 +322,23 @@ class PoseSearch:
         assert not self.model.training
 
         if init_poses is None:
+            if self.helix is not None:
+                #print('N pose before',np.shape(self.base_rot))
+                base_rot_euler = RR.from_matrix(self.base_rot.cpu()).as_euler('zyz',degrees=True)
+                # tilt condition for helical +- 10 degrees
+                condition1=(base_rot_euler[:,1]>=85) & (base_rot_euler[:,1]<=95)
+                # psi condition for helical based on prior
+                condition2 = (base_rot_euler[:, 2] >= 85) & (base_rot_euler[:, 2] <= 95)
+                condition3 = (base_rot_euler[:, 2] >= -95) & (base_rot_euler[:, 2] <= -85)
+                condition = condition1 & (condition2 | condition3)
+                self.base_rot = self.base_rot[condition]
+                self.so3_base_quat = self.so3_base_quat[condition]
+                self.so3_base_rot = self.so3_base_rot[condition]
+                self.nbase = len(self.base_rot)
+                #print('N pose after',np.shape(self.base_rot),np.shape(self.base_inplane),self.nbase)
+                #np.save('./rot.npy',self.base_rot)
+                #np.save('./rot_all.npy', self.so3_base_rot)
+                FAST_INPLANE = False
             # Expand the base grid B times if each image has a different z
             if z is not None:
                 base_rot = self.base_rot.expand(
@@ -323,7 +348,7 @@ class PoseSearch:
                 base_rot = self.base_rot  # 576 x 3 x 3
             base_rot = base_rot.to(device)
             # Compute the loss for all poses
-            L = self.getL(0)
+            L = min(self.Lmin, self.lattice.D // 2)
             loss = self.eval_grid(
                 images=self.translate_images(images, self.base_shifts, L),
                 rot=base_rot,

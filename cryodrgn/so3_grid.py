@@ -12,21 +12,23 @@ from . import lie_tools
 def grid_s1(resol):
     Npix = 6*2**resol
     dt = 2*np.pi/Npix
-    range=np.append(np.arange(3*Npix/16,5*Npix/16)*dt,np.arange(7*Npix/16,9*Npix/16)*dt)
-    grid = range + dt/2
-    print(len(grid))
+    grid = np.arange(Npix)*dt + dt/2
+    print('number of grid is ',len(grid))
     return grid
 
 def grid_s2(resol):
     Nside = 2**resol
     Npix = 12*Nside*Nside
     theta, phi = pix2ang(Nside, np.arange(Npix), nest=True)
-    print(theta)
-    pose_np=np.array([theta,phi])
-    pose_np=pose_np[:,pose_np[0,:]<=np.pi/18]
-    theta=pose_np[0]
-    phi=pose_np[1]
-    print(len(theta))
+    print('number of phi is', len(phi))
+    # try to confine the search range.
+    #print('number of theta before',len(theta))
+    #pose_np=np.array([theta,phi])
+    #pose_np=pose_np[:,pose_np[0,:]<=np.pi/18]
+    #theta=pose_np[0]
+    #phi=pose_np[1]
+    #print('number of theta after', len(theta))
+    #print('phi theta',phi, theta)
     return theta, phi
 
 def hopf_to_quat(theta, phi, psi):
@@ -46,7 +48,7 @@ def hopf_to_quat(theta, phi, psi):
 
 def grid_SO3(resol):
     theta, phi = grid_s2(resol)
-    psi = grid_s1(resol)
+    psi = grid_s1(resol-1)
     quat = hopf_to_quat(np.repeat(theta,len(psi)), # repeats each element by len(psi)
                         np.repeat(phi,len(psi)), # repeats each element by len(psi)
                         np.tile(psi,len(theta))) # tiles the array len(theta) times
