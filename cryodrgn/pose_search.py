@@ -75,9 +75,11 @@ class PoseSearch:
         helix=None
     ):
 
-        helix=True
+        helix=None
         if helix is not None:
             FAST_INPLANE=False
+        else:
+            FAST_INPLANE=True
         print('is helix mode',helix, 'fast inplane', FAST_INPLANE)
         self.helix = helix
         self.model = model
@@ -109,6 +111,26 @@ class PoseSearch:
         self._shift_neighbor_cache = {}  # for memoization
 
         self.device = device
+
+        if helix is not None:
+            print('N pose before', np.shape(self.base_rot))
+            base_rot_euler = RR.from_matrix(self.base_rot.cpu()).as_euler('zyz', degrees=True)
+            # tilt condition for helical +- 10 degrees
+            condition1 = (base_rot_euler[:, 1] >= 70) & (base_rot_euler[:, 1] <= 110)
+            # psi condition for helical based on prior
+            condition2 = (base_rot_euler[:, 2] >= 85) & (base_rot_euler[:, 2] <= 95)
+            condition3 = (base_rot_euler[:, 2] >= -95) & (base_rot_euler[:, 2] <= -85)
+            condition = condition1 & (condition2 | condition3)
+            self.list_index = np.arange(0, self.nbase)
+            self.list_index = self.list_index[condition]
+            print(len(self.list_index), self.list_index)
+            print('what to keep', condition)
+            self.base_rot = self.base_rot[condition]
+            self.nbase = len(self.base_rot)
+            print('N pose after', np.shape(self.base_rot), self.nbase)
+            # np.save('./rot.npy',self.base_rot)
+            # np.save('./rot_all.npy', self.so3_base_rot)
+
 
     def eval_grid(self, *, images, rot, z, NQ, L, images_tilt=None, angles_inplane=None, ctf_i=None):
         '''
@@ -323,22 +345,9 @@ class PoseSearch:
 
         if init_poses is None:
             if self.helix is not None:
-                #print('N pose before',np.shape(self.base_rot))
-                base_rot_euler = RR.from_matrix(self.base_rot.cpu()).as_euler('zyz',degrees=True)
-                # tilt condition for helical +- 10 degrees
-                condition1=(base_rot_euler[:,1]>=85) & (base_rot_euler[:,1]<=95)
-                # psi condition for helical based on prior
-                condition2 = (base_rot_euler[:, 2] >= 85) & (base_rot_euler[:, 2] <= 95)
-                condition3 = (base_rot_euler[:, 2] >= -95) & (base_rot_euler[:, 2] <= -85)
-                condition = condition1 & (condition2 | condition3)
-                self.base_rot = self.base_rot[condition]
-                self.so3_base_quat = self.so3_base_quat[condition]
-                self.so3_base_rot = self.so3_base_rot[condition]
-                self.nbase = len(self.base_rot)
-                #print('N pose after',np.shape(self.base_rot),np.shape(self.base_inplane),self.nbase)
-                #np.save('./rot.npy',self.base_rot)
-                #np.save('./rot_all.npy', self.so3_base_rot)
                 FAST_INPLANE = False
+            else:
+                FAST_INPLANE = True
             # Expand the base grid B times if each image has a different z
             if z is not None:
                 base_rot = self.base_rot.expand(
@@ -371,7 +380,11 @@ class PoseSearch:
                 .view(-1)
             )
             keepT, keepQ = init_poses.reshape(-1, 2).t()
-
+        if self.helix is not None:
+            #print(keepQ)
+            keepQ = self.list_index[keepQ]
+            keepQ = torch.tensor(keepQ)
+            #print(keepQ)
         new_init_poses = (
             torch.cat((keepT, keepQ), dim=-1)
             .view(2, B, self.nkeptposes)
