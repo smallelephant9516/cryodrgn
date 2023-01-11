@@ -1,7 +1,9 @@
 import argparse
 import pandas as pd
 import numpy as np
+import time
 
+start = time.process_time()
 def add_args(parser):
     parser.add_argument('star', help='Input starfile' )
     parser.add_argument('--relion31', action='store_true',help='whether use relion31 files or not')
@@ -45,16 +47,103 @@ def star2dataframe(filename, relion31=None):
         data.loc[:, "phi0"] = data["_rlnAnglePsiPrior"].astype(float).round(3) - 90.0
     return data
 
+def extract_helical_select(dataframe):
+    filament_data = dataframe.groupby(['filename', 'helicaltube'])
+    filament_index = list(filament_data.groups.keys())
+    helicaldic = {}
+    helicalnum = []
+    dtype = [('class2D', int), ('place', int), ('index', int)]
+    for i in range(len(filament_index)):
+        name = '-'.join(map(str, filament_index[i]))
+        helicaldic[name] = []
+        helicalnum = helicalnum + [name]
+    print('The filament number are: ', len(helicalnum))
+    print('The number of particles are:', len(dataframe))
+    for i in range(len(dataframe)):
+        particle = dataframe.iloc[i]
+        ID = str(particle['filename']) + '-' + str(particle['helicaltube'])
+        helicaldic[ID] = helicaldic[ID] + [(particle['class'], particle['pid'], i)]
+        if i % 10000 == 0:
+            end = time.process_time()
+            elapsed_time = (end - start)/60
+            print(i, '%s mins' % elapsed_time)
+    for i in range(len(helicalnum)):
+        lst = np.array(helicaldic[helicalnum[i]], dtype=dtype)
+        helicaldic[helicalnum[i]] = np.sort(lst, order='place')
+    print('finish converting')
+    for i in range(10):
+        print(helicaldic[helicalnum[i]])
+    corpus = list(helicaldic.values())
+
+    corpus_ignore = []
+    for i in range(len(corpus)):
+        corpus_row = []
+        lst = corpus[i]
+        count = lst[0][1]
+        for j in range(len(lst)):
+            particle = lst[j]
+            if count == int(particle[1]):
+                corpus_row.append(particle[2])
+                count += 1
+            else:
+                while 1:
+                    if count == int(lst[j][1]):
+                        corpus_row.append(particle[2])
+                        count += 1
+                        break
+                    corpus_row += ['?']
+                    count += 1
+        corpus_ignore.append(corpus_row)
+
+    return corpus_ignore
+
+def create_pairs(corpus_ignore,w=2):
+    w = int(w)
+    context_tuple_list = []
+    count=0
+    for text in corpus_ignore:
+        for i, word in enumerate(text):
+            if word == '?':
+                continue
+            first_context_word_index = max(0, i - w)
+            last_context_word_index = min(i + w + 1, len(text))
+            lst=[]
+            for j in range(first_context_word_index, last_context_word_index):
+                neighbor = text[j]
+                if neighbor == '?':
+                    continue
+                lst.append(neighbor)
+                count+=1
+            context_tuple_list.append([word,lst])
+    print("There are {} pairs of target and context words".format(count))
+    context_tuple_list=np.array(context_tuple_list)
+    ind=np.argsort(context_tuple_list[:,0])
+    context_tuple_list=context_tuple_list[ind]
+    context_tuple_list=context_tuple_list[:,-1]
+    return context_tuple_list
+
+
 def get_pair_index(dataframe, w=None, filament=None):
     filament_pairs=[]
     if filament:
         for i in range(len(dataframe)):
+            if i%10000==0:
+                end = time.process_time()
+                elapsed_time = end - start
+                print(f"Elapsed time: {elapsed_time} seconds for {i} particle")
             tube_id=list(dataframe['helicaltube'])[i]
             mic_id=list(dataframe['filename'])[i]
+            #print(tube_id,mic_id)
             lst=dataframe[(dataframe['helicaltube']==tube_id)&(dataframe['filename']==mic_id)].index.to_numpy()
             filament_pairs.append(lst)
+    else:
+        window_size=w
+        corpus_ignore=extract_helical_select(dataframe)
+        filament_pairs=create_pairs(corpus_ignore, window_size)
+
     filament_pairs=np.array(filament_pairs)
-    print(np.shape(filament_pairs),filament_pairs[0])
+    print(np.shape(filament_pairs))
+    print(filament_pairs[0])
     return filament_pairs
 
 
