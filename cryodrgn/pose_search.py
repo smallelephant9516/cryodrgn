@@ -72,24 +72,20 @@ class PoseSearch:
         t_xshift=0,
         t_yshift=0,
         device=None,
-        helix=None
+        helix=None,
+        theta_prior=np.pi/2,
+        theta_range=np.pi/18
     ):
-
         helix=None
-        if helix is not None:
-            FAST_INPLANE=False
-        else:
-            FAST_INPLANE=True
         print('is helix mode',helix, 'fast inplane', FAST_INPLANE)
         self.helix = helix
         self.model = model
         self.lattice = lattice
         self.base_healpy = base_healpy
-        self.so3_base_quat = so3_grid.grid_SO3(base_healpy)
+        self.so3_base_quat = so3_grid.grid_SO3(base_healpy,theta_prior=theta_prior, theta_range=theta_range)
         self.base_quat = (
-            so3_grid.s2_grid_SO3(base_healpy) if FAST_INPLANE else self.so3_base_quat
+            so3_grid.s2_grid_SO3(base_healpy,theta_prior=theta_prior, theta_range=theta_range) if FAST_INPLANE else self.so3_base_quat
         )
-        print(len(self.base_quat))
         self.so3_base_rot = lie_tools.quaternions_to_SO3(to_tensor(self.so3_base_quat)).to(device)
         self.base_rot = lie_tools.quaternions_to_SO3(to_tensor(self.base_quat)).to(device)
 
@@ -116,11 +112,12 @@ class PoseSearch:
             print('N pose before', np.shape(self.base_rot))
             base_rot_euler = RR.from_matrix(self.base_rot.cpu()).as_euler('zyz', degrees=True)
             # tilt condition for helical +- 10 degrees
-            condition1 = (base_rot_euler[:, 1] >= 70) & (base_rot_euler[:, 1] <= 110)
+            condition1 = (base_rot_euler[:, 1] >= 75) & (base_rot_euler[:, 1] <= 105)
             # psi condition for helical based on prior
-            condition2 = (base_rot_euler[:, 2] >= 85) & (base_rot_euler[:, 2] <= 95)
-            condition3 = (base_rot_euler[:, 2] >= -95) & (base_rot_euler[:, 2] <= -85)
-            condition = condition1 & (condition2 | condition3)
+            #condition2 = (base_rot_euler[:, 2] >= 85) & (base_rot_euler[:, 2] <= 95)
+            #condition3 = (base_rot_euler[:, 2] >= -95) & (base_rot_euler[:, 2] <= -85)
+            #condition = condition1 & (condition2 | condition3)
+            condition=condition1
             self.list_index = np.arange(0, self.nbase)
             self.list_index = self.list_index[condition]
             print(len(self.list_index), self.list_index)
@@ -332,27 +329,51 @@ class PoseSearch:
         return min(L, self.lattice.D // 2)
         # return min(self.Lmin * 2 ** iter_, self.Lmax)
 
-    def opt_theta_trans(self, images, z=None, images_tilt=None, init_poses=None, ctf_i=None):
+    def set_theta_value(self,theta_value,device):
+        self.so3_base_quat = so3_grid.grid_SO3(5, theta_prior=theta_value, theta_range=0)
+        self.base_quat = (
+            so3_grid.s2_grid_SO3(5, theta_prior=theta_value,
+                                 theta_range=0) if FAST_INPLANE else self.so3_base_quat
+        )
+        self.so3_base_rot = lie_tools.quaternions_to_SO3(to_tensor(self.so3_base_quat)).to(device)
+        self.base_rot = lie_tools.quaternions_to_SO3(to_tensor(self.base_quat)).to(device)
+        self.base_inplane = so3_grid.grid_s1(5)
+        self.nbase = len(self.base_rot)
+
+    def set_base_theta_value(self,theta_value,device):
+        so3_base_quat = so3_grid.grid_SO3(5, theta_prior=theta_value, theta_range=0)
+        base_quat = (
+            so3_grid.s2_grid_SO3(5, theta_prior=theta_value,
+                                 theta_range=0) if FAST_INPLANE else so3_base_quat
+        )
+        base_rot = lie_tools.quaternions_to_SO3(to_tensor(base_quat)).to(device)
+        return base_rot
+
+    def opt_theta_trans(self, images, z=None, images_tilt=None, init_poses=None, ctf_i=None, device=None,set_theta=None):
         images = to_tensor(images)
         images_tilt = to_tensor(images_tilt)
         init_poses = to_tensor(init_poses)
         z = to_tensor(z)
-        device = images.device
+        if device is None:
+            device = images.device
         do_tilt = images_tilt is not None
 
         B = images.size(0)
         assert not self.model.training
 
         if init_poses is None:
-            if self.helix is not None:
-                FAST_INPLANE = False
-            else:
-                FAST_INPLANE = True
             # Expand the base grid B times if each image has a different z
             if z is not None:
                 base_rot = self.base_rot.expand(
                     B, *self.base_rot.shape
                 )  # B x 576 x 3 x 3
+                if set_theta is not None:
+                    base_rot=[]
+                    for i in range(len(set_theta)):
+                        set_theta=set_theta[i]
+                        base_rot_sub=self.set_base_theta_value(set_theta,device)
+                        base_rot.append(base_rot_sub)
+                    base_rot=torch.tensor(base_rot)
             else:
                 base_rot = self.base_rot  # 576 x 3 x 3
             base_rot = base_rot.to(device)
@@ -380,11 +401,7 @@ class PoseSearch:
                 .view(-1)
             )
             keepT, keepQ = init_poses.reshape(-1, 2).t()
-        if self.helix is not None:
-            #print(keepQ)
-            keepQ = self.list_index[keepQ]
-            keepQ = torch.tensor(keepQ)
-            #print(keepQ)
+
         new_init_poses = (
             torch.cat((keepT, keepQ), dim=-1)
             .view(2, B, self.nkeptposes)

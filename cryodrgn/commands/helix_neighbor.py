@@ -17,7 +17,13 @@ def star2dataframe(filename, relion31=None):
     Rdata = []  # read the data
     start_read_line=1
     if relion31:
-        start_read_line=20
+        count=0
+        for star_line in open(filename).readlines():
+            if star_line.find("data_particles") ==0:
+                break
+            else:
+                count+=1
+        start_read_line=count
     for star_line in open(filename).readlines()[start_read_line:]:
         if star_line.find("_rln") != -1:
             var = star_line.split()

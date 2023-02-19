@@ -16,19 +16,20 @@ def grid_s1(resol):
     print('number of grid is ',len(grid))
     return grid
 
-def grid_s2(resol):
+def grid_s2(resol, theta_prior=None,theta_range=None):
     Nside = 2**resol
     Npix = 12*Nside*Nside
     theta, phi = pix2ang(Nside, np.arange(Npix), nest=True)
-    print('number of phi is', len(phi))
-    # try to confine the search range.
-    #print('number of theta before',len(theta))
-    #pose_np=np.array([theta,phi])
-    #pose_np=pose_np[:,pose_np[0,:]<=np.pi/18]
-    #theta=pose_np[0]
-    #phi=pose_np[1]
-    #print('number of theta after', len(theta))
-    #print('phi theta',phi, theta)
+    if theta_prior is not None:
+        # try to confine the search range.
+        print('number of theta before',len(theta))
+        pose_np=np.array([theta,phi])
+        #index = (pose_np[0, :] >= 4 * np.pi / 9) & (pose_np[0, :] <= 5 * np.pi / 9)
+        index = (pose_np[0, :] >= theta_prior-theta_range) & (pose_np[0, :] <= theta_prior + theta_range)
+        pose_np=pose_np[:,index]
+        theta=pose_np[0]
+        phi=pose_np[1]
+        print('number of theta after', len(theta))
     return theta, phi
 
 def hopf_to_quat(theta, phi, psi):
@@ -46,16 +47,16 @@ def hopf_to_quat(theta, phi, psi):
                      st*np.sin(phi+psi/2)])
     return quat.T.astype(np.float32)
 
-def grid_SO3(resol):
-    theta, phi = grid_s2(resol)
+def grid_SO3(resol,theta_prior=None, theta_range=np.pi/18):
+    theta, phi = grid_s2(resol, theta_prior=theta_prior, theta_range=theta_range)
     psi = grid_s1(resol)
     quat = hopf_to_quat(np.repeat(theta,len(psi)), # repeats each element by len(psi)
                         np.repeat(phi,len(psi)), # repeats each element by len(psi)
                         np.tile(psi,len(theta))) # tiles the array len(theta) times
     return quat #hmm convert to rot matrix?
 
-def s2_grid_SO3(resol):
-    theta, phi = grid_s2(resol)
+def s2_grid_SO3(resol,theta_prior=None, theta_range=np.pi/18):
+    theta, phi = grid_s2(resol, theta_prior=theta_prior, theta_range=theta_range)
     quat = hopf_to_quat(theta, phi, np.zeros((len(phi),)))
     return quat
 

@@ -61,8 +61,9 @@ def add_args(parser):
 
     group = parser.add_argument_group('Symmetry parameters')
     group.add_argument('--helix', help='Processing helical structure')
-    group.add_argument('--helix_beta', help='Processing helical structure')
+    group.add_argument('--helix_beta', type=float, help='Weight for processing helical structure')
     group.add_argument('--helix_loss', help='loss function for helix contrast learning')
+    group.add_argument('--helix_z_average', type=float, help='Iteration to average the vector along the helix')
 
     group = parser.add_argument_group('Tilt series')
     group.add_argument('--tilt', help='Particle stack file (.mrcs)')
@@ -125,6 +126,30 @@ def off_diagonal(x):
     return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
 
 
+def nce_loss(input1,input2,device,temperature=0.5):
+    cos = nn.CosineSimilarity(dim=-1).to(device)
+    sim11 = cos(input1.unsqueeze(-2), input1.unsqueeze(-3)) / temperature
+    sim22 = cos(input2.unsqueeze(-2), input2.unsqueeze(-3)) / temperature
+    sim12 = cos(input1.unsqueeze(-2), input2.unsqueeze(-3)) / temperature
+
+    d = sim12.shape[-1]
+
+    sim11[..., range(d), range(d)] = float('-inf')
+    sim22[..., range(d), range(d)] = float('-inf')
+    raw_scores1 = torch.cat([sim12, sim11], dim=-1)
+    raw_scores2 = torch.cat([sim22, sim12.transpose(-1, -2)], dim=-1)
+    logits = torch.cat([raw_scores1, raw_scores2], dim=-2)
+    labels = torch.arange(2 * d, dtype=torch.long, device=logits.device)
+    criterion = nn.CrossEntropyLoss().to(device)
+    nce_loss = criterion(logits, labels)
+    return nce_loss
+
+def import_pickle(file_path):
+    file=open(file_path,'rb')
+    data=pickle.load(file)
+    file.close()
+    data=torch.tensor(data)
+    return data
 
 def make_model(args, lattice, enc_mask, in_dim):
     return HetOnlyVAE(
@@ -172,12 +197,18 @@ def pretrain(args, model, lattice, optim, minibatch, tilt):
     return gen_loss.item()
 
 def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equivariance=None, enc_only=False, poses=None,
-          ctf_params=None, y_neighbor=None, helix_beta=None,helix_loss=None):
+          ctf_params=None, y_neighbor=None, helix_pose=None, helix_beta=None,helix_loss=None,only_helix_encoder=False,helix_z_av=None):
+
+    if helix_z_av is not None:
+        y_neighbor=None
+        neighbor_loss=torch.tensor([0])
+
     y, yt = minibatch
     use_tilt = yt is not None
     use_ctf = ctf_params is not None
     B = y.size(0)
     D = lattice.D
+    device=y.device
 
     if use_ctf:
         freqs = lattice.freqs2d.unsqueeze(0).expand(B,*lattice.freqs2d.shape)/ctf_params[:,0].view(B,1,1)
@@ -194,14 +225,17 @@ def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equi
     if use_ctf:
         input_ = (x*ctf_i.sign() for x in input_) # phase flip by the ctf
     z_mu, z_logvar = unparallelize(model).encode(*input_)
+    if helix_z_av is not None:
+        z_mu, z_logvar= (helix_z_av[0,:],helix_z_av[1,:])
     z = unparallelize(model).reparameterize(z_mu, z_logvar)
 
     if y_neighbor is not None:
-        y_neighbor=(y_neighbor,)
+        input_neighbor=(y_neighbor,)
         if use_ctf:
-            y_neighbor = (x * ctf_i.sign() for x in y_neighbor)
-        neighbor_mu, neighbor_logvar = unparallelize(model).encode(*y_neighbor)
+            input_neighbor = (x * ctf_i.sign() for x in input_neighbor)
+        neighbor_mu, neighbor_logvar = unparallelize(model).encode(*input_neighbor)
         z_neighbor = unparallelize(model).reparameterize(neighbor_mu, neighbor_logvar)
+
         if helix_loss == 'cos_sim':
             neighbor_loss = F.cosine_similarity(z, z_neighbor)
             neighbor_loss=torch.mean(neighbor_loss)
@@ -214,10 +248,20 @@ def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equi
             on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
             off_diag = off_diagonal(c).pow_(2).sum()
             neighbor_loss = torch.mean(on_diag + off_diag)
-
-        elif helix_loss == None:
-            #mse loss
-            neighbor_loss=F.mse_loss(z, z_neighbor)
+        elif helix_loss=='MSE':
+            # mse loss
+            neighbor_loss = F.mse_loss(z, z_neighbor)
+        elif helix_loss == 'Harmony':
+            #https://github.com/xulabs/aitom/tree/master/aitom/classify/deep/unsupervised/disentangled_representation/harmony
+            #print(z, z_neighbor, 'z value')
+            dist_z1 = torch.distributions.multivariate_normal.MultivariateNormal(z_mu,torch.diag_embed(z_logvar.exp()))
+            dist_z2 = torch.distributions.multivariate_normal.MultivariateNormal(neighbor_mu,torch.diag_embed(neighbor_logvar.exp()))
+            neighbor_loss = torch.mean(torch.distributions.kl.kl_divergence(dist_z1, dist_z2)).div(D**2)
+        elif helix_loss=='NCELoss':
+            neighbor_loss= nce_loss(z_mu,neighbor_mu,device)
+            #neighbor_loss=nce_loss(z, z_neighbor,device)
+        elif helix_loss==None:
+            neighbor_loss=F.mse_loss(z_mu, neighbor_mu)+F.mse_loss(z_logvar.exp(), neighbor_logvar.exp())
 
     if equivariance is not None:
         lamb, equivariance_loss = equivariance
@@ -240,24 +284,24 @@ def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equi
 
     # reconstruct circle of pixels instead of whole image
     mask = lattice.get_circular_mask(L)
-    def gen_slice(R):
+    def gen_slice(R,z):
         slice_ = model(lattice.coords[mask] @ R, z).view(B,-1)
         if use_ctf:
             slice_ *= ctf_i.view(B,-1)[:,mask]
         return slice_
-    def translate(img):
+    def translate(img,trans):
         img = lattice.translate_ht(img, trans.unsqueeze(1), mask)
         return img.view(B,-1)
 
     y = y.view(B,-1)[:, mask]
     if use_tilt: yt = yt.view(B,-1)[:, mask]
-    y = translate(y)
-    if use_tilt: yt = translate(yt)
+    y = translate(y,trans)
+    if use_tilt: yt = translate(yt,trans)
 
     if use_tilt:
-        gen_loss = .5*F.mse_loss(gen_slice(rot), y) + .5*F.mse_loss(gen_slice(bnb.tilt @ rot), yt)
+        gen_loss = .5*F.mse_loss(gen_slice(rot,z), y) + .5*F.mse_loss(gen_slice(bnb.tilt @ rot,z), yt)
     else:
-        gen_loss = F.mse_loss(gen_slice(rot), y)
+        gen_loss = F.mse_loss(gen_slice(rot,z), y)
 
     kld = -0.5 * torch.mean(1 + z_logvar - z_mu.pow(2) - z_logvar.exp())
     if torch.isnan(kld):
@@ -273,11 +317,37 @@ def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equi
     if equivariance is not None:
         loss += lamb*eq_loss
 
-    if y_neighbor:
+    if y_neighbor is not None:
         if helix_beta is None:
             helix_beta=1
-        loss+=float(helix_beta)*neighbor_loss
-        print(gen_loss, kld, neighbor_loss)
+        helix_beta = torch.tensor(helix_beta)
+
+        if only_helix_encoder is True:
+            loss += helix_beta * neighbor_loss / mask.sum()
+        else:
+            if poses is not None:  # use provided poses
+                rot_helix = helix_pose[0]
+                trans_helix = helix_pose[1]
+            else:  # pose search
+                model.eval()
+                with torch.no_grad():
+                    rot_helix, trans_helix, _base_pose_helix = ps.opt_theta_trans(
+                        y_neighbor,
+                        z=z_neighbor,
+                        images_tilt=None if enc_only else yt,
+                        ctf_i=ctf_i,
+                        device=device,
+                    )
+                model.train()
+            y_neighbor = y_neighbor.view(B, -1)[:, mask]
+            y_neighbor = translate(y_neighbor,trans_helix)
+            gen_loss_helix = F.mse_loss(gen_slice(rot_helix, z_neighbor), y_neighbor)
+            kld_helix = -0.5 * torch.mean(1 + neighbor_logvar - neighbor_mu.pow(2) - neighbor_logvar.exp()) / mask.sum()
+
+            #loss = (gen_loss_helix + beta*kld_helix/mask.sum())
+            #loss = gen_loss + gen_loss_helix + helix_beta * neighbor_loss/mask.sum()
+            loss += gen_loss_helix + helix_beta * neighbor_loss / mask.sum()
+        #print(gen_loss, kld, neighbor_loss)
 
 
     loss.backward()
@@ -285,7 +355,7 @@ def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equi
     optim.step()
     save_pose = [rot.detach().cpu().numpy()]
     save_pose.append(trans.detach().cpu().numpy())
-    return gen_loss.item(), kld.item(), loss.item(), eq_loss.item() if equivariance else None, save_pose
+    return gen_loss.item(), kld.item(), loss.item(), eq_loss.item() if equivariance else None, neighbor_loss.item(), save_pose
 
 def eval_z(model, lattice, data, batch_size, device, trans=None, use_tilt=False, ctf_params=None):
     assert not model.training
@@ -326,6 +396,8 @@ def save_checkpoint(model, lattice, optim, epoch, norm, search_pose, z_mu, z_log
     # save z
     with open(out_z,'wb') as f:
         pickle.dump(z_mu, f)
+        pickle.dump(z_logvar, f)
+    with open('./var_tmp.pkl','wb') as f:
         pickle.dump(z_logvar, f)
     with open(out_poses,'wb') as f:
         pickle.dump(search_pose, f)
@@ -573,6 +645,7 @@ def main(args):
         gen_loss_accum = 0
         loss_accum = 0
         eq_loss_accum = 0
+        helix_loss_accum = 0
         batch_it = 0
         poses, base_poses = [], []
 
@@ -587,10 +660,12 @@ def main(args):
         if args.reset_model_every and (epoch - 1) % args.reset_model_every == 0:
             flog(">> Resetting model")
             model = make_model(args, lattice, enc_mask, in_dim)
+            model.to(device)
 
         if args.reset_optim_every and (epoch - 1) % args.reset_optim_every == 0:
             flog(">> Resetting optim")
             optim = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
+            model.to(device)
 
         if epoch % args.ps_freq != 0:
             flog('Using previous iteration poses')
@@ -598,18 +673,40 @@ def main(args):
         if args.helix is not None:
             neighbor_id = np.array([np.random.choice(lst, 1) for lst in helix_neighbor])
 
+        z_helix_av = None
+        #if (epoch % args.helix_z_average == 0) & (epoch > 0):
+        #    flog('Using previous iteration z for average')
+        #    z_mu_all=import_pickle('{}/z.{}.pkl'.format(args.outdir, epoch-1))
+        #    z_logvar_all=import_pickle('./var_tmp.pkl')
+        #    z_mu_av=[torch.mean(z_mu_all[helix_neighbor[i]],axis=0) for i in range(len(helix_neighbor))]
+        #    z_logvar_av=[torch.mean(z_logvar_all[helix_neighbor[i]],axis=0) for i in range(len(helix_neighbor))]
+        #    z_mu_av=torch.stack(tuple(z_mu_av))
+        #    z_logvar_av = torch.stack(tuple(z_logvar_av))
+        #    z_helix_av=torch.stack((z_mu_av,z_logvar_av),dim=0).to(device)
+        #elif (epoch == 0) & (args.helix_z_average is not None):
+        #    z_helix_av=torch.zeros((2,len(helix_neighbor),args.zdim)).to(device)
+
         for batch in data_iterator:
             ind = batch[-1]
             y_neighbor=None
             helix_beta=None
+            z_helix_av_select=None
             if args.helix:
-                neighbor_select=neighbor_id[ind]
-                y_neighbor=data[neighbor_select][0]
-                image_size=len(y_neighbor[0][0])
-                y_neighbor=torch.tensor(y_neighbor)
-                y_neighbor=y_neighbor.view((-1,image_size,image_size))
-                y_neighbor=y_neighbor.to(device)
-                helix_beta= args.helix_beta if args.helix_beta else None
+                neighbor_select = neighbor_id[ind]
+                # print('index', ind, 'index_select',neighbor_select)
+                if len(np.shape(neighbor_select)) == 2:
+                    neighbor_select = neighbor_select[:, 0]
+                if z_helix_av is not None:
+                    y_neighbor = None
+                    helix_beta = None
+                    z_helix_av_select=z_helix_av[:,neighbor_select,:]
+                    #print(np.shape(z_helix_av_select))
+                else:
+                    y_neighbor=data[neighbor_select][0]
+                    y_neighbor=torch.tensor(y_neighbor)
+                    y_neighbor=y_neighbor.to(device)
+                    helix_beta = args.helix_beta if args.helix_beta else None
+
             ind_np = ind.cpu().numpy()
             batch = (batch[0].to(device), None) if tilt is None else (batch[0].to(device), batch[1].to(device))
             batch_it += len(batch[0])
@@ -624,8 +721,18 @@ def main(args):
             # train the model
             if epoch % args.ps_freq != 0:
                 p = [torch.tensor(x[ind_np], device=device) for x in sorted_poses]
+                p_helix=None
+                if args.helix is not None:
+                    p_helix = [torch.tensor(x[neighbor_select], device=device) for x in sorted_poses]
+            elif (epoch == 0) & (args.load_poses is not None):
+                sorted_poses = utils.load_pkl(args.load_poses)
+                p = [torch.tensor(x[ind_np], device=device) for x in sorted_poses]
+                p_helix=None
+                if args.helix is not None:
+                    p_helix = [torch.tensor(x[neighbor_select], device=device) for x in sorted_poses]
             else:
                 p = None
+                p_helix= None
 
             cc += len(batch[0])
             if args.pose_model_update_freq and cc > args.pose_model_update_freq:
@@ -633,21 +740,28 @@ def main(args):
                 cc = 0
 
             ctf_i = ctf_params[ind] if ctf_params is not None else None
-            gen_loss, kld, loss, eq_loss, pose = train(model, lattice, ps, optim, L_model, batch, beta, args.beta_control, equivariance_tuple, enc_only=args.enc_only, poses=p, ctf_params=ctf_i,
-                                                       y_neighbor=y_neighbor,helix_beta=helix_beta, helix_loss=args.helix_loss)
+            gen_loss, kld, loss, eq_loss, helix_loss,pose = train(model, lattice, ps, optim, L_model, batch, beta, args.beta_control, equivariance_tuple,
+                                                       enc_only=args.enc_only, poses=p, ctf_params=ctf_i,y_neighbor=y_neighbor,
+                                                       helix_pose= p_helix,helix_beta=helix_beta, helix_loss=args.helix_loss,helix_z_av=z_helix_av_select)
+
             # logging
             poses.append((ind.cpu().numpy(),pose))
             kld_accum += kld*len(ind)
             gen_loss_accum += gen_loss*len(ind)
+            if helix_loss is not None:
+                helix_loss_accum+=helix_loss*len(ind)
             if args.equivariance:eq_loss_accum += eq_loss*len(ind)
 
             loss_accum += loss*len(ind)
             if batch_it % args.log_interval == 0:
+                print(ind, neighbor_select)
                 eq_log = f'equivariance={eq_loss:.4f}, lambda={lamb:.4f}, ' if args.equivariance else ''
-                log(f'# [Train Epoch: {epoch+1}/{num_epochs}] [{batch_it}/{Nimg} images] gen loss={gen_loss:.4f}, kld={kld:.4f}, beta={beta:.4f}, {eq_log}loss={loss:.4f}')
+                helix_loss_show=helix_loss if args.helix else ''
+                log(f'# [Train Epoch: {epoch+1}/{num_epochs}] [{batch_it}/{Nimg} images] gen loss={gen_loss:.4f}, kld={kld:.4f}, beta={beta:.4f}, {eq_log}loss={loss:.4f}, helix_loss={helix_loss_show}')
 
         eq_log = 'equivariance = {:.4f}, '.format(eq_loss_accum/Nimg) if args.equivariance else ''
-        flog('# =====> Epoch: {} Average gen loss = {:.4}, KLD = {:.4f}, {}total loss = {:.4f}; Finished in {}'.format(epoch+1, gen_loss_accum/Nimg, kld_accum/Nimg, eq_log, loss_accum/Nimg, dt.now() - t2))
+        helix_loss_show='helical_loss = {:.4f}, '.format(helix_loss_accum/Nimg) if args.helix else ''
+        flog('# =====> Epoch: {} Average gen loss = {:.4}, KLD = {:.4f}, {}{}total loss = {:.4f}; Finished in {}'.format(epoch+1, gen_loss_accum/Nimg, kld_accum/Nimg, eq_log, helix_loss_show, loss_accum/Nimg, dt.now() - t2))
 
         sorted_poses = sort_poses(poses) if poses else None
 
