@@ -23,7 +23,7 @@ from cryodrgn import dataset
 from cryodrgn import lie_tools
 
 from cryodrgn.lattice import Lattice
-from cryodrgn.pose_search import PoseSearch
+from cryodrgn.pose_search import PoseSearch, PoseSearch_helical, PoseSearch_helical_refine
 from cryodrgn.models import HetOnlyVAE, unparallelize
 from cryodrgn.beta_schedule import get_beta_schedule, LinearSchedule
 from cryodrgn.losses import EquivarianceLoss
@@ -64,6 +64,7 @@ def add_args(parser):
     group.add_argument('--helix_beta', type=float, help='Weight for processing helical structure')
     group.add_argument('--helix_loss', help='loss function for helix contrast learning')
     group.add_argument('--helix_z_average', type=float, help='Iteration to average the vector along the helix')
+    parser.add_argument('--psi_prior', metavar='npy', type=os.path.abspath, help='the prior psi angle')
 
     group = parser.add_argument_group('Tilt series')
     group.add_argument('--tilt', help='Particle stack file (.mrcs)')
@@ -71,7 +72,7 @@ def add_args(parser):
     group.add_argument('--enc-only', action='store_true', help='Use the tilt pair only in VAE and not in BNB search')
 
     group = parser.add_argument_group('Training parameters')
-    group.add_argument('-n', '--num-epochs', type=int, default=30, help='Number of training epochs (default: %(default)s)')
+    group.add_argument('-n', '--num-epochs', type=int, default=50, help='Number of training epochs (default: %(default)s)')
     group.add_argument('-b','--batch-size', type=int, default=8, help='Minibatch size (default: %(default)s)')
     group.add_argument('--wd', type=float, default=0, help='Weight decay in Adam optimizer (default: %(default)s)')
     group.add_argument('--lr', type=float, default=1e-4, help='Learning rate in Adam optimizer (default: %(default)s)')
@@ -196,9 +197,11 @@ def pretrain(args, model, lattice, optim, minibatch, tilt):
     optim.step()
     return gen_loss.item()
 
-def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equivariance=None, enc_only=False, poses=None,
-          ctf_params=None, y_neighbor=None, helix_pose=None, helix_beta=None,helix_loss=None,only_helix_encoder=False,helix_z_av=None):
+def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equivariance=None, index=None, enc_only=False, poses=None,
+          ctf_params=None, y_neighbor=None, helix_pose=None, helix_beta=None,helix_loss=None,only_helix_encoder=False,helix_z_av=None, epoch=None):
 
+    if y_neighbor is None:
+        neighbor_loss = torch.tensor([0])
     if helix_z_av is not None:
         y_neighbor=None
         neighbor_loss=torch.tensor([0])
@@ -273,6 +276,10 @@ def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equi
         trans = poses[1]
     else: # pose search
         model.eval()
+
+        device = z.device
+        z = torch.randn(z.shape, device=device)
+
         with torch.no_grad():
             rot, trans, _base_pose = ps.opt_theta_trans(
                 y,
@@ -608,10 +615,21 @@ def main(args):
     out_config = '{}/config.pkl'.format(args.outdir)
     save_config(args, data, lattice, model, out_config)
 
-    ps = PoseSearch(pose_model, lattice, args.l_start, args.l_end, tilt,
+    test_helical_prior = True
+    print('helical_prior', test_helical_prior)
+
+    if test_helical_prior is True:
+
+        ps = PoseSearch_helical_refine(pose_model, lattice, args.l_start, args.l_end, tilt,
+                        t_extent=args.t_extent, t_ngrid=args.t_ngrid, niter=args.niter,
+                        nkeptposes=args.nkeptposes, base_healpy=args.base_healpy,
+                        t_xshift=args.t_xshift, t_yshift=args.t_yshift, device=device)
+
+    else:
+        ps = PoseSearch(pose_model, lattice, args.l_start, args.l_end, tilt,
                     t_extent=args.t_extent, t_ngrid=args.t_ngrid, niter=args.niter,
                     nkeptposes=args.nkeptposes, base_healpy=args.base_healpy,
-                    t_xshift=args.t_xshift, t_yshift=args.t_yshift, device=device,helix=args.helix)
+                    t_xshift=args.t_xshift, t_yshift=args.t_yshift, device=device)
 
     data_iterator = DataLoader(data, batch_size=args.batch_size, shuffle=True)
 
@@ -724,9 +742,10 @@ def main(args):
                 p_helix=None
                 if args.helix is not None:
                     p_helix = [torch.tensor(x[neighbor_select], device=device) for x in sorted_poses]
-            elif (epoch == 0) & (args.load_poses is not None):
+            elif (epoch==0) & (args.load_poses is not None):
+
                 sorted_poses = utils.load_pkl(args.load_poses)
-                p = [torch.tensor(x[ind_np], device=device) for x in sorted_poses]
+                p = [torch.tensor(x[ind_np], device=device, dtype=torch.float32) for x in sorted_poses]
                 p_helix=None
                 if args.helix is not None:
                     p_helix = [torch.tensor(x[neighbor_select], device=device) for x in sorted_poses]
@@ -741,8 +760,8 @@ def main(args):
 
             ctf_i = ctf_params[ind] if ctf_params is not None else None
             gen_loss, kld, loss, eq_loss, helix_loss,pose = train(model, lattice, ps, optim, L_model, batch, beta, args.beta_control, equivariance_tuple,
-                                                       enc_only=args.enc_only, poses=p, ctf_params=ctf_i,y_neighbor=y_neighbor,
-                                                       helix_pose= p_helix,helix_beta=helix_beta, helix_loss=args.helix_loss,helix_z_av=z_helix_av_select)
+                                                       enc_only=args.enc_only, poses=p, ctf_params=ctf_i,y_neighbor=y_neighbor, index=ind, helix_pose= p_helix,
+                                                        helix_beta=helix_beta, helix_loss=args.helix_loss,helix_z_av=z_helix_av_select, epoch=epoch)
 
             # logging
             poses.append((ind.cpu().numpy(),pose))
@@ -754,7 +773,6 @@ def main(args):
 
             loss_accum += loss*len(ind)
             if batch_it % args.log_interval == 0:
-                print(ind, neighbor_select)
                 eq_log = f'equivariance={eq_loss:.4f}, lambda={lamb:.4f}, ' if args.equivariance else ''
                 helix_loss_show=helix_loss if args.helix else ''
                 log(f'# [Train Epoch: {epoch+1}/{num_epochs}] [{batch_it}/{Nimg} images] gen loss={gen_loss:.4f}, kld={kld:.4f}, beta={beta:.4f}, {eq_log}loss={loss:.4f}, helix_loss={helix_loss_show}')

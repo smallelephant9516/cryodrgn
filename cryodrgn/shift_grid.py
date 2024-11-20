@@ -7,8 +7,8 @@ def grid_1d(resol, extent, ngrid, shift=0):
     return grid
 
 def grid_2d(resol, extent, ngrid, xshift=0, yshift=0):
-    x = grid_1d(resol, extent, ngrid, shift=xshift)
-    y = grid_1d(resol, extent, ngrid, shift=yshift)
+    x = grid_1d(resol, extent/10000, ngrid, shift=xshift)
+    y = grid_1d(resol, extent/10, ngrid, shift=yshift)
     # convention: x is fast dim, y is slow dim
     grid = np.stack(np.meshgrid(x,y),-1) 
     return grid.reshape(-1,2)
