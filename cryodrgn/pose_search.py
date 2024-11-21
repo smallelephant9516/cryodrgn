@@ -471,8 +471,6 @@ class PoseSearch:
 
         return best_rot, best_trans, new_init_poses
 
-
-
 class PoseSearch_helical_refine:
     """Pose search"""
 
@@ -869,40 +867,66 @@ class PoseSearch_helical:
         base_healpy=1,
         t_extent=5,
         t_ngrid=7,
+        niter=5,
         nkeptposes=24,
         loss_fn="msf",
         t_xshift=0,
         t_yshift=0,
-        psi_prior = None,
         device=None,
+        theta_prior=np.pi/2,
+        theta_range=np.pi/18
     ):
-        print('fast inplane', FAST_INPLANE)
-
+        helix=True
+        print('is helix mode',helix, 'fast inplane', FAST_INPLANE)
         self.model = model
         self.lattice = lattice
-        self.psi_prior_rot = rot_2d_batch(torch.tensor(psi_prior, dtype=torch.float32), device=device)
-        self.base_full = so3_grid.helical_sample_grid(2,5)
-        self.base_rot = self.base_full.reshape(-1,3,3)
-        self.so3_base_full, self.angle_shape = so3_grid.helical_sample_grid_so3(2, 5, 5)
-        self.so3_base_rot = self.so3_base_full.reshape(-1, 3, 3)
-        print(len(self.so3_base_rot),len(self.base_rot))
-        self.nbase = len(self.base_rot)
-        self.base_inplane = torch.tensor(so3_grid.helical_sample_psi(5))
+        self.base_healpy = base_healpy
+        self.so3_base_quat = so3_grid.grid_SO3(base_healpy,theta_prior=theta_prior, theta_range=theta_range)
+        self.base_quat = (
+            so3_grid.s2_grid_SO3(base_healpy,theta_prior=theta_prior, theta_range=theta_range) if FAST_INPLANE else self.so3_base_quat
+        )
+        self.so3_base_rot = lie_tools.quaternions_to_SO3(to_tensor(self.so3_base_quat)).to(device)
+        self.base_rot = lie_tools.quaternions_to_SO3(to_tensor(self.base_quat)).to(device)
+
+        self.nbase = len(self.base_quat)
+        self.base_inplane_zero = so3_grid.grid_s1_fix(0)
+        self.base_inplane = so3_grid.grid_s1(base_healpy)
         self.base_shifts = torch.tensor(
             shift_grid.base_shift_grid(base_healpy - 1, t_extent, t_ngrid, xshift=t_xshift, yshift=t_yshift),
             device=device).float()
         self.t_extent = t_extent
         self.t_ngrid = t_ngrid
-        self.nkeptposes = nkeptposes
 
         self.Lmin = Lmin
         self.Lmax = Lmax
+        self.niter = niter
         self.tilt = tilt
+        self.nkeptposes = nkeptposes
         self.loss_fn = loss_fn
         self._so3_neighbor_cache = {}  # for memoization
         self._shift_neighbor_cache = {}  # for memoization
 
         self.device = device
+
+        print('N pose before', np.shape(self.base_rot))
+        base_rot_euler = RR.from_matrix(self.base_rot.cpu()).as_euler('zyz', degrees=True)
+        base_so3_rot_euler = RR.from_matrix(self.so3_base_rot.cpu()).as_euler('zyz', degrees=True)
+        # tilt condition for helical +- 10 degrees
+        condition1 = (base_rot_euler[:, 1] >= 80) & (base_rot_euler[:, 1] <= 100)
+        condition=condition1
+        self.list_index = np.arange(0, self.nbase)
+        self.list_index = self.list_index[condition]
+
+        n_in_plane_rot = len(self.base_inplane)
+        self.list_index = np.repeat(self.list_index,1)*n_in_plane_rot+np.tile(np.arange(1),len(self.list_index))
+        print(len(self.list_index), self.list_index)
+        self.list_index = torch.tensor(self.list_index)
+        #print('what to keep', condition)
+        self.base_rot_tilt_prior = self.base_rot[condition]
+        self.nbase_tilt_prior = len(self.base_rot_tilt_prior)
+        print('N pose after', np.shape(self.base_rot_tilt_prior), self.nbase_tilt_prior)
+        # np.save('./rot.npy',self.base_rot)
+        # np.save('./rot_all.npy', self.so3_base_rot)
 
 
     def eval_grid(self, *, images, rot, z, NQ, L, images_tilt=None, angles_inplane=None, ctf_i=None):
@@ -919,7 +943,6 @@ class PoseSearch_helical:
         device = next(self.model.parameters()).device
         if ctf_i is not None:
             ctf_i = ctf_i.view(B,1,1,-1)[...,mask] # Bx1x1xYX
-
         def compute_err(images, rot):
 
             if angles_inplane is not None:
@@ -927,7 +950,6 @@ class PoseSearch_helical:
                 # to avoid artifacts due to grid alignment
                 rand_a = angles_inplane[np.random.randint(len(angles_inplane))]
                 rand_inplane_rot = rot_2d(rand_a, 3, rot.device)
-
                 rot = rand_inplane_rot @ rot
                 adj_angles_inplane = angles_inplane - rand_a
 
@@ -1040,6 +1062,41 @@ class PoseSearch_helical:
         # FIXME: will this cache get too big? maybe don't do it when res is too
         return self._shift_neighbor_cache[key]
 
+    def subdivide(self, quat, q_ind, cur_res):
+        """
+        Subdivides poses for next resolution level
+
+        Inputs:
+            quat (N x 4 tensor): quaternions
+            q_ind (N x 2 np.array): index of current S2xS1 grid
+            cur_res (int): Current resolution level
+
+        Returns:
+            quat  (N x 8 x 4) np.array
+            q_ind (N x 8 x 2) np.array
+            rot   (N*8 x 3 x 3) tensor
+            trans (N*4 x 2) tensor
+        """
+        N = quat.shape[0]
+
+        assert len(quat.shape) == 2 and quat.shape == (N, 4), quat.shape
+        assert len(q_ind.shape) == 2 and q_ind.shape == (N, 2), q_ind.shape
+
+        # get neighboring SO3 elements at next resolution level -- todo: make this an array operation
+        neighbors = [
+            self.get_neighbor_so3(quat[i], q_ind[i][0], q_ind[i][1], cur_res)
+            for i in range(len(quat))
+        ]
+        quat = np.array([x[0] for x in neighbors])  # Bx8x4
+        q_ind = np.array([x[1] for x in neighbors])  # Bx8x2
+        rot = lie_tools.quaternions_to_SO3(torch.from_numpy(quat).view(-1, 4)).to(self.device)
+
+        assert len(quat.shape) == 3 and quat.shape == (N, 8, 4), quat.shape
+        assert len(q_ind.shape) == 3 and q_ind.shape == (N, 8, 2), q_ind.shape
+        assert len(rot.shape) == 3 and rot.shape == (N * 8, 3, 3), rot.shape
+
+        return quat, q_ind, rot
+
     def keep_matrix(self, loss, B, max_poses):
         """
         Inputs:
@@ -1051,18 +1108,12 @@ class PoseSearch_helical:
         shape = loss.shape
         assert len(shape) == 3
         best_loss, best_trans_idx = loss.min(1)
-
         flat_loss = best_loss.view(B, -1)
-
-        import matplotlib.pyplot as plt
-
         flat_idx = flat_loss.topk(max_poses, dim=-1, largest=False, sorted=True)[1]
-
         # add the batch index in, to make it completely flat
         flat_idx += (
             torch.arange(B, device=loss.device).unsqueeze(1) * flat_loss.shape[1]
         )
-
         flat_idx = flat_idx.view(-1)
 
         keep_idx = torch.empty(
@@ -1073,59 +1124,59 @@ class PoseSearch_helical:
         keep_idx[1] = best_trans_idx[keep_idx[0], keep_idx[2]]
         return keep_idx
 
-    def opt_theta_trans(self, images, z=None, images_tilt=None, ctf_i=None, device=None, index=None):
+    def getL(self, iter_):
+        L = self.Lmin + int(iter_ / self.niter * (self.Lmax - self.Lmin))
+        return min(L, self.lattice.D // 2)
+        # return min(self.Lmin * 2 ** iter_, self.Lmax)
 
-
-        images_tilt = None
+    def opt_theta_trans(self, images, z=None, images_tilt=None, init_poses=None, ctf_i=None, device=None,set_theta=None):
+        images = to_tensor(images)
+        images_tilt = to_tensor(images_tilt)
+        init_poses = to_tensor(init_poses)
         z = to_tensor(z)
         if device is None:
             device = images.device
-
-        images = to_tensor(images)
-        psi_rot = self.psi_prior_rot[index]
-
-        flip_operation = torch.tensor([[1, -1, 1], [-1, 1, -1], [1, -1, 1]], dtype=torch.float32, device=device)
-        flip_operation = flip_operation.unsqueeze(0).unsqueeze(0)
+        do_tilt = images_tilt is not None
 
         B = images.size(0)
         assert not self.model.training
 
-        if z is not None:
-            base_rot = self.base_rot.expand(
-                B, *self.base_rot.shape
-            )  # B x 576 x 3 x 3
-            psi_rot = psi_rot.unsqueeze(1)
+        if init_poses is None:
+            # Expand the base grid B times if each image has a different z
+            if z is not None:
+                base_rot = self.base_rot_tilt_prior.expand(
+                    B, *self.base_rot_tilt_prior.shape
+                )  # B x 576 x 3 x 3
+            else:
+                base_rot = self.base_rot_tilt_prior  # 576 x 3 x 3
+            base_rot = base_rot.to(device)
+            # Compute the loss for all poses
+            L = min(self.Lmin, self.lattice.D // 2)
+
+            loss = self.eval_grid(
+                images=self.translate_images(images, self.base_shifts, L),
+                rot=base_rot,
+                z=z,
+                NQ=self.nbase_tilt_prior,
+                L=L,
+                images_tilt=self.translate_images(images_tilt, self.base_shifts, L) if do_tilt else None,
+                angles_inplane=self.base_inplane_zero if FAST_INPLANE else None,
+                ctf_i=ctf_i
+            )
+            keepB, keepT, keepQ = self.keep_matrix(
+                loss, B, self.nkeptposes
+            ).cpu()  # B x -1
         else:
-            base_rot = self.base_rot  # 576 x 3 x 3
-        base_rot = base_rot.to(device)
-        base_rot = psi_rot @ base_rot
-        base_rot = base_rot*flip_operation
+            # careful, overwrite the old batch index which is now invalid
+            keepB = (
+                torch.arange(B, device=init_poses.device)
+                .unsqueeze(1)
+                .repeat(1, self.nkeptposes)
+                .view(-1)
+            )
+            keepT, keepQ = init_poses.reshape(-1, 2).t()
 
-        #z = torch.normal(0,1,size=(B,8),device=device,dtype=torch.float32)
-
-        # Compute the loss for all poses
-        # control the radius of the image
-        L = min(self.Lmin, self.lattice.D // 2)
-
-        loss = self.eval_grid(
-            images=self.translate_images(images, self.base_shifts, L),
-            rot=base_rot,
-            z=z,
-            NQ=self.nbase,
-            L=L,
-            angles_inplane=self.base_inplane if FAST_INPLANE else None,
-            ctf_i=ctf_i
-        )
-
-        #import matplotlib.pyplot as plt
-        #data = loss[0,0].reshape(self.angle_shape)
-        #data = data[:,:,2].cpu()
-        #plt.imshow(data)
-        #plt.show()
-
-        keepB, keepT, keepQ = self.keep_matrix(
-            loss, B, self.nkeptposes
-        ).cpu()  # B x -1
+        keepQ = self.list_index[keepQ]
 
         new_init_poses = (
             torch.cat((keepT, keepQ), dim=-1)
@@ -1133,15 +1184,56 @@ class PoseSearch_helical:
             .permute(1, 2, 0)
         )
 
+        quat = self.so3_base_quat[keepQ]
+        q_ind = so3_grid.get_base_ind(keepQ, self.base_healpy)  # Np x 2
+        trans = self.base_shifts[keepT]
+        shifts = self.base_shifts.clone()
+        for iter_ in range(1, self.niter + 1):
+            keepB8 = (
+                keepB.unsqueeze(1).repeat(1, 8).view(-1)
+            )  # repeat each element 8 times
+            zb = z[keepB8] if z is not None else None
+
+            L = self.getL(iter_)
+            quat, q_ind, rot = self.subdivide(quat, q_ind, iter_ + self.base_healpy - 1)
+            shifts /= 2
+            trans = trans.unsqueeze(1) + shifts.unsqueeze(0)  # FIXME: scale
+
+            rot = rot.to(device)
+            loss = self.eval_grid(
+                images=self.translate_images(
+                    images[keepB], trans, L
+                ),  # (B*24, 4, Npoints)
+                rot=rot,
+                z=zb,
+                NQ=8,
+                L=L,
+                images_tilt=self.translate_images(images_tilt[keepB],trans, L) if do_tilt else None, # (B*24, 4, Npoints)
+                ctf_i=ctf_i[keepB] if ctf_i is not None else ctf_i
+            ) # sum(NP), 8
+
+            # nkeptposes = 1
+            # nkeptposes = max(1, math.ceil(self.nkeptposes / 2 ** (iter_-1)))
+            nkeptposes = self.nkeptposes if iter_ < self.niter else 1
+
+            keepBN, keepT, keepQ = self.keep_matrix(
+                loss, B, nkeptposes
+            ).cpu()  # B x (self.Nkeptposes*32)
+            keepB = keepBN * B // loss.shape[0]  # FIXME: expain
+            assert (
+                len(keepB) == B * nkeptposes
+            ), f"{len(keepB)} != {B} x {nkeptposes} at iter {iter_}"
+            quat = quat[keepBN, keepQ]
+            q_ind = q_ind[keepBN, keepQ]
+            trans = trans[keepBN, keepT]
+
         bestBN, bestT, bestQ = self.keep_matrix(loss, B, 1).cpu()
         assert len(bestBN) == B
-
-
-        best_rot = self.so3_base_rot[bestQ].to(device)
-        best_trans = self.base_shifts[bestT].to(device)
-
-        psi_rot = psi_rot.squeeze(1)
-        best_rot = psi_rot @ best_rot
-        best_rot = best_rot*(flip_operation.squeeze(0).squeeze(0))
+        if self.niter == 0:
+            best_rot = self.so3_base_rot[bestQ].to(device)
+            best_trans = self.base_shifts[bestT].to(device)
+        else:
+            best_rot = rot.view(-1, 8, 3, 3)[bestBN, bestQ]
+            best_trans = trans.to(device)
 
         return best_rot, best_trans, new_init_poses

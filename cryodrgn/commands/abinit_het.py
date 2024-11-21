@@ -277,8 +277,8 @@ def train(model, lattice, ps, optim, L, minibatch, beta, beta_control=None, equi
     else: # pose search
         model.eval()
 
-        device = z.device
-        z = torch.randn(z.shape, device=device)
+        #device = z.device
+        #z = torch.randn(z.shape, device=device)
 
         with torch.no_grad():
             rot, trans, _base_pose = ps.opt_theta_trans(
